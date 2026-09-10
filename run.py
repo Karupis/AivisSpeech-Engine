@@ -116,6 +116,22 @@ def decide_port_from_env(env_name: str) -> int | None:
     return None
 
 
+def decide_positive_int_from_env(env_name: str, default: int) -> int:
+    """環境変数から正の整数値を返す。無効な値の場合はデフォルト値を返す。"""
+    env = os.getenv(env_name)
+    if env is None or env == "":
+        return default
+    try:
+        value = int(env)
+        if value >= 1:
+            return value
+    except ValueError:
+        pass
+    msg = f"Invalid environment variable value: {env_name}={env}"
+    warnings.warn(msg, stacklevel=1)
+    return default
+
+
 @dataclass(frozen=True)
 class Envs:
     """環境変数の集合"""
@@ -127,6 +143,7 @@ class Envs:
     host: str | None
     port: int | None
     use_gpu: bool
+    max_concurrent_inference: int
 
 
 _env_adapter = TypeAdapter(Envs)
@@ -142,6 +159,9 @@ def read_environment_variables() -> Envs:
         host=os.getenv("VV_HOST"),
         port=decide_port_from_env("VV_PORT"),
         use_gpu=decide_boolean_from_env("VV_USE_GPU"),
+        max_concurrent_inference=decide_positive_int_from_env(
+            "AIVIS_MAX_CONCURRENT_INFERENCE", 1
+        ),
     )
     return _env_adapter.validate_python(asdict(envs))
 
@@ -458,7 +478,12 @@ def main() -> None:
         # AivisSpeech Engine 独自の StyleBertVITS2TTSEngine を通常の TTSEngine の代わりに利用
         tts_engines = TTSEngineManager()
         tts_engines.register_engine(
-            StyleBertVITS2TTSEngine(aivm_manager, use_gpu, args.load_all_models),
+            StyleBertVITS2TTSEngine(
+                aivm_manager,
+                use_gpu,
+                args.load_all_models,
+                max_concurrent_inference=envs.max_concurrent_inference,
+            ),
             MOCK_CORE_VERSION,
         )
 

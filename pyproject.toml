@@ -33,6 +33,8 @@ dependencies = [
   "truststore>=0.10.0,<1.0.0",
   # aivmlib は AIVMX ファイルのメタデータ読み取りに必要
   "aivmlib>=1.2.1,<2.0.0",
+  # 複数の ONNX Runtime セッション間で AIVMX のモデル重みを共有するために必要
+  "onnx>=1.17.0,<2.0.0",
   # AivisSpeech-Engine にはカスタマイズされた Style-Bert-VITS2 が必要
   "style-bert-vits2 @ git+https://github.com/tsukumijima/Style-Bert-VITS2@6b0ec1352fd09b5295568fc98db4e851d3c17249",
   # OS に応じて適切な ONNX Runtime プラグインをインストール

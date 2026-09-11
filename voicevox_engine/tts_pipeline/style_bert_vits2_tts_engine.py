@@ -1,11 +1,14 @@
 """AivisSpeech Engine におけるテキスト音声合成エンジンの実装"""
 
 import copy
+import gc
+import os
 import re
 import shutil
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Final
@@ -13,9 +16,11 @@ from typing import Any, Final
 import aivmlib
 import jaconv
 import numpy as np
+import onnx
 import onnxruntime
 from fastapi import HTTPException
 from numpy.typing import NDArray
+from onnx import numpy_helper
 from onnxruntime.capi.onnxruntime_pybind11_state import InvalidProtobuf, NoSuchFile
 from pyopenjtalk import tsqyomi
 from style_bert_vits2.constants import (
@@ -52,6 +57,69 @@ from ..tts_pipeline.tts_engine import (
 from ..utility.path_utility import get_save_dir
 
 
+class _TTSModelSessionPool:
+    """同一モデルの独立した TTSModel セッションを管理する。"""
+
+    def __init__(
+        self,
+        models: Sequence[TTSModel],
+        shared_initializer_arrays: Sequence[NDArray[Any]] = (),
+        shared_initializer_values: Sequence[onnxruntime.OrtValue] = (),
+    ) -> None:
+        if len(models) < 1:
+            raise ValueError("models must contain at least one TTSModel.")
+
+        self.models = list(models)
+        self._available_models = list(models)
+        self._shared_initializer_arrays = list(shared_initializer_arrays)
+        self._shared_initializer_values = list(shared_initializer_values)
+        self._condition = threading.Condition()
+        self._active_count = 0
+        self._closing = False
+
+    @property
+    def primary_model(self) -> TTSModel:
+        """メタデータ参照用の先頭モデルを返す。"""
+
+        return self.models[0]
+
+    @contextmanager
+    def acquire(self) -> Iterator[TTSModel]:
+        """空いている独立セッションを一つ取得する。"""
+
+        with self._condition:
+            while len(self._available_models) == 0 and self._closing is False:
+                self._condition.wait()
+            if self._closing is True:
+                raise RuntimeError("TTS model session pool is closing.")
+            model = self._available_models.pop()
+            self._active_count += 1
+
+        try:
+            yield model
+        finally:
+            with self._condition:
+                self._active_count -= 1
+                if self._closing is False:
+                    self._available_models.append(model)
+                self._condition.notify_all()
+
+    def unload(self) -> None:
+        """実行中の推論完了を待って全セッションをアンロードする。"""
+
+        with self._condition:
+            self._closing = True
+            while self._active_count > 0:
+                self._condition.wait()
+
+        for model in self.models:
+            model.unload()
+        self.models.clear()
+        self._available_models.clear()
+        self._shared_initializer_values.clear()
+        self._shared_initializer_arrays.clear()
+
+
 class StyleBertVITS2TTSEngine(TTSEngine):
     """
     AivisSpeech Engine におけるテキスト音声合成エンジンの実装。
@@ -73,7 +141,11 @@ class StyleBertVITS2TTSEngine(TTSEngine):
         use_gpu: bool = False,
         load_all_models: bool = False,
         bert_model_cache_dir: Path | None = None,
+        max_concurrent_inference: int = 1,
     ) -> None:
+        if max_concurrent_inference < 1:
+            raise ValueError("max_concurrent_inference must be at least 1.")
+
         self.aivm_manager = aivm_manager
         self.use_gpu = use_gpu
         self.load_all_models = load_all_models
@@ -87,11 +159,17 @@ class StyleBertVITS2TTSEngine(TTSEngine):
 
         # ロード済みモデルのキャッシュ
         self.tts_models: dict[str, TTSModel] = {}
+        # モデルごとの独立した ONNX Runtime セッションプール
+        self._tts_model_session_pools: dict[str, _TTSModelSessionPool] = {}
         # ロード済みモデルのキャッシュへのアクセスを排他制御するためのロック
         self._tts_models_lock: threading.Lock = threading.Lock()
 
-        # ONNX Runtime の推論処理を排他制御するためのロック
-        self._inference_lock: Final[threading.Lock] = threading.Lock()
+        # ONNX Runtime の独立した推論セッション数と同時実行数
+        self._max_concurrent_inference: Final[int] = max_concurrent_inference
+        self._inference_semaphore: Final[threading.BoundedSemaphore] = (
+            threading.BoundedSemaphore(max_concurrent_inference)
+        )
+        logger.info(f"TTS model session pool size: {max_concurrent_inference}")
 
         # ONNX Runtime での推論に利用するデバイスを選択
         ## デフォルト: CPU 推論 (CPUExecutionProvider)
@@ -279,6 +357,213 @@ class StyleBertVITS2TTSEngine(TTSEngine):
             ),
         )
 
+    def _create_onnx_session_options(
+        self,
+        shared_initializers: Sequence[tuple[str, onnxruntime.OrtValue]] = (),
+    ) -> onnxruntime.SessionOptions:
+        """TTS モデル用の ONNX Runtime セッション設定を生成する。"""
+
+        sess_options = onnxruntime.SessionOptions()
+        first_provider = self.onnx_providers[0]
+        first_provider_name = (
+            first_provider if isinstance(first_provider, str) else first_provider[0]
+        )
+        if first_provider_name == "DmlExecutionProvider":
+            sess_options.graph_optimization_level = (
+                onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+        else:
+            sess_options.graph_optimization_level = (
+                onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
+        sess_options.log_severity_level = 3
+
+        for env_name, attribute_name in (
+            ("ORT_INTRA_OP_NUM_THREADS", "intra_op_num_threads"),
+            ("ORT_INTER_OP_NUM_THREADS", "inter_op_num_threads"),
+        ):
+            value = os.getenv(env_name)
+            if value is None or value == "":
+                continue
+            try:
+                thread_count = int(value)
+                if thread_count < 1:
+                    raise ValueError
+            except ValueError:
+                logger.warning(
+                    f"Invalid environment variable value: {env_name}={value}"
+                )
+                continue
+            setattr(sess_options, attribute_name, thread_count)
+
+        execution_mode = os.getenv("ORT_EXECUTION_MODE")
+        if execution_mode is not None and execution_mode != "":
+            normalized_execution_mode = execution_mode.strip().lower()
+            if normalized_execution_mode in ("parallel", "par", "ort_parallel", "1"):
+                sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+            elif normalized_execution_mode in (
+                "sequential",
+                "seq",
+                "ort_sequential",
+                "0",
+            ):
+                sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+            else:
+                logger.warning(
+                    f"Invalid environment variable value: ORT_EXECUTION_MODE={execution_mode}"
+                )
+
+        for initializer_name, initializer_value in shared_initializers:
+            sess_options.add_initializer(initializer_name, initializer_value)
+
+        return sess_options
+
+    @staticmethod
+    def _load_shared_initializers(
+        model_path: Path,
+    ) -> tuple[
+        list[NDArray[Any]],
+        list[tuple[str, onnxruntime.OrtValue]],
+    ]:
+        """AIVMX 内の initializer を複数セッションで共有可能な形で読み込む。"""
+
+        model_proto = onnx.load(model_path, load_external_data=False)
+        initializer_arrays: list[NDArray[Any]] = []
+        shared_initializers: list[tuple[str, onnxruntime.OrtValue]] = []
+        for initializer in model_proto.graph.initializer:
+            initializer_array = numpy_helper.to_array(initializer)
+            if initializer_array.flags.c_contiguous is False:
+                initializer_array = np.ascontiguousarray(initializer_array)
+            initializer_arrays.append(initializer_array)
+            shared_initializers.append(
+                (
+                    initializer.name,
+                    onnxruntime.OrtValue.ortvalue_from_numpy(initializer_array),
+                )
+            )
+
+        # numpy 配列と OrtValue が initializer の実体を保持するため、巨大な ModelProto は解放できる
+        del model_proto
+        gc.collect()
+        return initializer_arrays, shared_initializers
+
+    def _create_tts_model(
+        self,
+        model_path: Path,
+        hyper_parameters: HyperParameters,
+        style_vectors: NDArray[Any],
+    ) -> TTSModel:
+        """共通の設定から TTSModel を一つ生成する。"""
+
+        return TTSModel(
+            model_path=model_path,
+            config_path=hyper_parameters,
+            style_vec_path=style_vectors,
+            onnx_providers=self.onnx_providers,
+        )
+
+    def _create_tts_model_session_pool(
+        self,
+        model_path: Path,
+        hyper_parameters: HyperParameters,
+        style_vectors: NDArray[Any],
+    ) -> _TTSModelSessionPool:
+        """同一モデルの独立した推論セッションプールを生成する。"""
+
+        # デフォルトの単一セッションでは、従来通り Style-Bert-VITS2 側にロードを任せる
+        if self._max_concurrent_inference == 1:
+            tts_model = self._create_tts_model(
+                model_path,
+                hyper_parameters,
+                style_vectors,
+            )
+            tts_model.load()
+            return _TTSModelSessionPool([tts_model])
+
+        first_provider = self.onnx_providers[0]
+        first_provider_name = (
+            first_provider if isinstance(first_provider, str) else first_provider[0]
+        )
+        initializer_arrays: list[NDArray[Any]] = []
+        shared_initializers: list[tuple[str, onnxruntime.OrtValue]] = []
+        if first_provider_name == "CPUExecutionProvider":
+            initializer_arrays, shared_initializers = self._load_shared_initializers(
+                model_path
+            )
+
+        tts_models: list[TTSModel] = []
+        for _ in range(self._max_concurrent_inference):
+            tts_model = self._create_tts_model(
+                model_path,
+                hyper_parameters,
+                style_vectors,
+            )
+            tts_model.onnx_session = onnxruntime.InferenceSession(
+                str(model_path),
+                sess_options=self._create_onnx_session_options(shared_initializers),
+                providers=self.onnx_providers,
+            )
+            tts_models.append(tts_model)
+
+        return _TTSModelSessionPool(
+            tts_models,
+            shared_initializer_arrays=initializer_arrays,
+            shared_initializer_values=[value for _, value in shared_initializers],
+        )
+
+    def _load_model_session_pool(
+        self,
+        aivm_model_uuid: str,
+    ) -> _TTSModelSessionPool:
+        """モデルのセッションプールをロードし、キャッシュして返す。"""
+
+        with self._tts_models_lock:
+            if aivm_model_uuid in self._tts_model_session_pools:
+                return self._tts_model_session_pools[aivm_model_uuid]
+
+        # AIVM メタデータを読み込む
+        aivm_info = self.aivm_manager.get_aivm_info(aivm_model_uuid)
+        try:
+            with open(aivm_info.file_path, mode="rb") as f:
+                aivm_metadata = aivmlib.read_aivmx_metadata(f)
+        except aivmlib.AivmValidationError as ex:
+            logger.error(
+                f"{aivm_info.file_path}: Failed to read AIVM metadata:", exc_info=ex
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to read AIVM metadata.",
+            ) from ex
+
+        hyper_parameters = HyperParameters.model_validate(
+            aivm_metadata.hyper_parameters.model_dump()
+        )
+        assert aivm_metadata.style_vectors is not None
+        style_vectors = np.load(BytesIO(aivm_metadata.style_vectors))
+
+        start_time = time.time()
+        logger.info(f"Loading {aivm_info.manifest.name} ({aivm_model_uuid}) ...")
+        session_pool = self._create_tts_model_session_pool(
+            aivm_info.file_path,
+            hyper_parameters,
+            style_vectors,
+        )
+        with self._tts_models_lock:
+            if aivm_model_uuid in self._tts_model_session_pools:
+                logger.info(
+                    f"{aivm_info.manifest.name} ({aivm_model_uuid}) is already loaded in another thread. Using existing instance.",
+                )
+                existing_session_pool = self._tts_model_session_pools[aivm_model_uuid]
+                session_pool.unload()
+                return existing_session_pool
+            self._tts_model_session_pools[aivm_model_uuid] = session_pool
+            self.tts_models[aivm_model_uuid] = session_pool.primary_model
+        self.aivm_manager.update_model_load_state(aivm_model_uuid, is_loaded=True)
+        logger.info(
+            f"{aivm_info.manifest.name} ({aivm_model_uuid}) loaded with {len(session_pool.models)} session(s). ({time.time() - start_time:.2f}s)"
+        )
+        return session_pool
+
     def load_model(self, aivm_model_uuid: str) -> TTSModel:
         """
         Style-Bert-VITS2 の音声合成モデルをロードする。
@@ -296,62 +581,18 @@ class StyleBertVITS2TTSEngine(TTSEngine):
             ロード済みの TTSModel インスタンス (キャッシュ済みの場合はそのまま返す)
         """
 
-        # 既に読み込まれている場合はそのまま返す
-        with self._tts_models_lock:
-            if aivm_model_uuid in self.tts_models:
-                return self.tts_models[aivm_model_uuid]
+        return self._load_model_session_pool(aivm_model_uuid).primary_model
 
-        # AIVM メタデータを読み込む
-        aivm_info = self.aivm_manager.get_aivm_info(aivm_model_uuid)
-        try:
-            with open(aivm_info.file_path, mode="rb") as f:
-                aivm_metadata = aivmlib.read_aivmx_metadata(f)
-        except aivmlib.AivmValidationError as ex:
-            logger.error(
-                f"{aivm_info.file_path}: Failed to read AIVM metadata:", exc_info=ex
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to read AIVM metadata.",
-            ) from ex
+    @contextmanager
+    def _acquire_model_for_inference(
+        self,
+        aivm_model_uuid: str,
+    ) -> Iterator[TTSModel]:
+        """推論中に独占利用するモデルセッションを取得する。"""
 
-        # ハイパーパラメータを読み込む
-        hyper_parameters = HyperParameters.model_validate(
-            aivm_metadata.hyper_parameters.model_dump()
-        )
-
-        # スタイルベクトルを読み込む
-        assert aivm_metadata.style_vectors is not None
-        style_vectors = np.load(BytesIO(aivm_metadata.style_vectors))
-
-        # 音声合成モデルをロード
-        tts_model = TTSModel(
-            # 音声合成モデルのパスとして、AIVMX ファイル (ONNX 互換) のパスを指定
-            model_path=aivm_info.file_path,
-            # config_path とあるが、HyperParameters の Pydantic モデルを直接指定できる
-            config_path=hyper_parameters,
-            # style_vec_path とあるが、style_vectors の NDArray を直接指定できる
-            style_vec_path=style_vectors,
-            # ONNX 推論で利用する ExecutionProvider を指定
-            onnx_providers=self.onnx_providers,
-        )  # fmt: skip
-        start_time = time.time()
-        logger.info(f"Loading {aivm_info.manifest.name} ({aivm_model_uuid}) ...")
-        tts_model.load()
-        with self._tts_models_lock:
-            # ロード中に別スレッドが同一モデルを先にロードした場合は、そのインスタンスを優先して利用する
-            if aivm_model_uuid in self.tts_models:
-                logger.info(
-                    f"{aivm_info.manifest.name} ({aivm_model_uuid}) is already loaded in another thread. Using existing instance.",
-                )
-                return self.tts_models[aivm_model_uuid]
-            self.tts_models[aivm_model_uuid] = tts_model
-        self.aivm_manager.update_model_load_state(aivm_model_uuid, is_loaded=True)
-        logger.info(
-            f"{aivm_info.manifest.name} ({aivm_model_uuid}) loaded. ({time.time() - start_time:.2f}s)"
-        )
-
-        return tts_model
+        session_pool = self._load_model_session_pool(aivm_model_uuid)
+        with session_pool.acquire() as tts_model:
+            yield tts_model
 
     def unload_model(self, aivm_model_uuid: str) -> None:
         """
@@ -370,7 +611,7 @@ class StyleBertVITS2TTSEngine(TTSEngine):
 
         with self._tts_models_lock:
             # モデルがロードされていない場合は何もしない
-            if aivm_model_uuid not in self.tts_models:
+            if aivm_model_uuid not in self._tts_model_session_pools:
                 logger.warning(
                     f"TTS model {aivm_info.manifest.name} ({aivm_model_uuid}) is already unloaded. Skipping unload.",
                 )
@@ -379,11 +620,12 @@ class StyleBertVITS2TTSEngine(TTSEngine):
                     is_loaded=False,
                 )
                 return
-            tts_model = self.tts_models[aivm_model_uuid]
+            session_pool = self._tts_model_session_pools[aivm_model_uuid]
+            del self._tts_model_session_pools[aivm_model_uuid]
             del self.tts_models[aivm_model_uuid]
 
-        # モデルをアンロード
-        tts_model.unload()
+        # 実行中の推論完了を待って全セッションをアンロード
+        session_pool.unload()
         self.aivm_manager.update_model_load_state(aivm_model_uuid, is_loaded=False)
         logger.info(
             f"{aivm_info.manifest.name} ({aivm_model_uuid}) unloaded. ({time.time() - start_time:.2f}s)"
@@ -406,7 +648,7 @@ class StyleBertVITS2TTSEngine(TTSEngine):
         """
 
         with self._tts_models_lock:
-            return aivm_model_uuid in self.tts_models
+            return aivm_model_uuid in self._tts_model_session_pools
 
     def create_accent_phrases(
         self,
@@ -785,10 +1027,15 @@ class StyleBertVITS2TTSEngine(TTSEngine):
         ## pitchScale の基準は 0.0 (-1 ~ 1) なので、1.0 を基準とした 0 ~ 2 の範囲に変換する
         pitch_scale = max(0.0, 1.0 + query.pitchScale)
 
-        # 音声合成を実行
+        # 独立した ONNX Runtime セッションを一つ取得して音声合成を実行
         ## 出力音声は int16 型の NDArray で返される
-        ## 推論処理を大量に並列実行すると最悪プロセスごと ONNX Runtime がクラッシュするため、排他ロックを掛ける
-        with self._inference_lock:
+        ## 推論処理を大量に並列実行すると最悪プロセスごと ONNX Runtime がクラッシュするため、セッション数を超える同時実行を防ぐ
+        with (
+            self._inference_semaphore,
+            self._acquire_model_for_inference(
+                str(aivm_manifest.uuid)
+            ) as inference_model,
+        ):
             logger.info("Running inference...")
             logger.info(f"Text: {text}")
             logger.info(f"         Speed: {length:.2f} (Input: {query.speedScale:.2f})")
@@ -802,7 +1049,7 @@ class StyleBertVITS2TTSEngine(TTSEngine):
             # テキストが空文字列ではなく、given_phone_list / given_tone_list が空でない場合のみ音声合成を実行
             if text != "" and len(given_phone_list) > 0 and len(given_tone_list) > 0:
                 start_time = time.time()
-                raw_sample_rate, raw_wave = model.infer(
+                raw_sample_rate, raw_wave = inference_model.infer(
                     text=text,
                     given_phone=given_phone_list,
                     given_tone=given_tone_list,

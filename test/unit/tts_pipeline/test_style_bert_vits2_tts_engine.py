@@ -2,6 +2,8 @@
 
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -87,13 +89,22 @@ class _StyleBertVITS2TTSEngineForTest(StyleBertVITS2TTSEngine):
 
     def __init__(self, recording_tts_model: _RecordingTTSModel) -> None:
         self.aivm_manager = cast(AivmManager, _StaticAivmManager())
-        object.__setattr__(self, "_inference_lock", threading.Lock())
+        object.__setattr__(self, "_inference_semaphore", threading.BoundedSemaphore(1))
         self.recording_tts_model = recording_tts_model
 
     def load_model(self, aivm_model_uuid: str) -> Any:
         """記録用 TTSModel 互換オブジェクトを返す。"""
 
         return self.recording_tts_model
+
+    @contextmanager
+    def _acquire_model_for_inference(
+        self,
+        aivm_model_uuid: str,
+    ) -> Iterator[Any]:
+        """記録用 TTSModel 互換オブジェクトを推論用に返す。"""
+
+        yield self.recording_tts_model
 
 
 def _generate_style_bert_vits2_tts_engine(
